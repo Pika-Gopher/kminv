@@ -71,6 +71,23 @@ func main() {
 
 Within this repository, run the package tests with `go test ./...`.
 
+## CLI
+
+The Stage 1 interactive client is available as a separate executable:
+
+```text
+go run ./cmd/kminv ./data.kv
+```
+
+It opens the database once, displays a `kminv>` prompt, and supports `SET`,
+`GET`, `DELETE`, `HAS`, `HELP`, `EXIT`, and `QUIT`. Values are initially
+displayed as text; binary values are not guaranteed to be readable losslessly
+in the terminal. Quote arguments containing spaces, for example:
+
+```text
+SET greeting "hello world"
+```
+
 ## Behavior and limitations
 
 - Keys are limited to 1,024 bytes.
