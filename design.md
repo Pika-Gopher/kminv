@@ -17,6 +17,10 @@ It accepts keys and values, stores mutations in a local binary log, and maintain
 
 kminv is a database engine, not an application built on top of an existing database.
 
+The V1 implementation is an embedded, single-process database. It does not
+provide process locking; opening the same database from multiple processes is
+unsupported.
+
 ### 1.2 Primary goals
 
 - Implement a persistent key-value store from first principles.
@@ -147,8 +151,11 @@ Responsibilities:
 
 1. Open or create the authoritative log.
 2. Validate the file header.
-3. Recover the database state from valid persisted data.
-4. Reconstruct or load the in-memory index.
+3. Recover and validate the authoritative log, repairing only a clearly
+   incomplete final tail.
+4. Load and validate `<log path>.index` when present. A valid snapshot is
+   installed and its log suffix is replayed; a missing, malformed, stale or
+   inconsistent snapshot causes a full index rebuild from the recovered log.
 5. Return a usable `DB` instance only after successful initialization.
 
 If unrecoverable corruption is detected, `Open` returns an error.
@@ -197,13 +204,17 @@ Closes the database safely.
 
 It must:
 
-1. Prevent new operations from beginning.
-2. Wait for operations already in progress.
-3. Attempt to persist an index snapshot if snapshot support is enabled.
-4. Close the log file.
-5. Return an error if required shutdown work fails.
+1. Mark the instance closed while holding the database mutex, preventing new
+   operations from beginning.
+2. Capture the current log position and index while serialized with mutations.
+3. Attempt to persist an index snapshot.
+4. Close the log file even if snapshot persistence fails.
+5. Return snapshot and/or log-close errors, preserving both when both fail.
 
-Closing must be safe to call more than once. The implementation must define and test its exact behavior when the database is already closed or in a failed state.
+The instance remains terminally closed after `Close()` begins, including when
+snapshot persistence or log closure returns an error. Repeated `Close()` calls
+are no-ops and return `nil`. If the database is already in the failed mutation
+state, `Close()` skips snapshot persistence and still attempts to close the log.
 
 ---
 
@@ -416,7 +427,19 @@ Responsibilities:
 - Write a new snapshot safely.
 - Load a valid snapshot when the startup consistency checks permit it.
 
-Snapshot support must never be allowed to hide corruption in the authoritative log.
+Snapshot support must never be allowed to hide corruption in the authoritative
+log. Snapshot persistence uses a temporary file in the destination directory,
+then syncs, closes and publishes it through platform-specific replacement
+helpers.
+
+The implementation also contains platform-specific helpers:
+
+- `snapshot_replace_unix.go` uses `os.Rename` on Unix-like systems.
+- `snapshot_replace_windows.go` uses `ReplaceFileW` when the destination exists
+  and `MoveFileExW` when it does not.
+- `snapshot_dirsync_unix.go` opens and syncs the parent directory.
+- `snapshot_dirsync_windows.go` treats parent-directory syncing as unsupported
+  and performs no operation.
 
 ### 8.5 Tests
 
@@ -479,6 +502,11 @@ The implementation must not scan arbitrary bytes for a possible next record. Doi
 
 Recovery must track the end offset of the last fully validated record. Truncation must use that boundary, never a guessed offset.
 
+The implementation records validated record boundaries and the validated log
+end for snapshot consistency checks. Log validation is read-only; only normal
+startup recovery may truncate and sync an incomplete final tail. Snapshot
+validation never modifies the log.
+
 ---
 
 ## 10. Write Durability and Failure Handling
@@ -517,13 +545,18 @@ This prevents the process from continuing to operate on a log whose state is unc
 
 A failed database instance must not silently resume normal reads and writes.
 
-The implementation must define which operations remain permitted in the failed state, particularly `Close`, and test them.
+`Get`, `Set` and `Delete` return errors while the instance is failed. `Close`
+remains permitted, skips snapshot persistence and closes the log.
 
 ### 10.4 File creation durability
 
 Synchronizing the log does not necessarily guarantee that a newly created filename's directory entry is durable on every supported platform.
 
-Directory synchronization may be needed for stronger crash-durability guarantees. This behavior must be documented and implemented according to the supported operating systems.
+Directory synchronization may be needed for stronger crash-durability guarantees.
+Snapshot publication syncs the parent directory on Unix-like systems. The
+Windows implementation does not sync a directory handle because that operation
+is not reliably supported there. The implementation therefore does not claim
+identical directory-entry durability guarantees across platforms.
 
 ---
 
@@ -543,9 +576,10 @@ V1 does not provide operating-system file locking or cross-process coordination.
 
 ### 11.3 Close semantics
 
-Closing must prevent new operations from starting and wait for existing operations to finish before closing the file.
-
-The lock and lifecycle state must be designed to avoid deadlocks between `Close` and active operations.
+Closing holds the single database mutex, so it is serialized with `Get`, `Set`
+and `Delete`. The instance is marked closed before snapshot persistence and log
+closure begin. A failed shutdown is still terminal. Repeated calls return
+`nil` after the first call.
 
 ### 11.4 Future concurrency improvements
 
@@ -563,25 +597,28 @@ These are not V1 requirements.
 
 ## 12. Index Snapshots
 
-A separate index snapshot file, such as `db.index`, is intended to reduce the work needed to reconstruct the in-memory index.
+A separate index snapshot file, `<log path>.index`, is intended to reduce the work needed to reconstruct the in-memory index.
 
 The log remains authoritative. A snapshot is only a derived representation of state.
 
 ### 12.1 Snapshot format
 
-The proposed binary format is:
+The implemented binary format is:
 
 | Field | Size | Purpose |
 |---|---:|---|
-| Start magic | 8 bytes | Identifies the snapshot format |
-| Version | 4 bytes | Snapshot format version |
+| Start magic | 8 bytes | ASCII `KMINVIDX` |
+| Version | 4 bytes | Big-endian unsigned integer; value `1` |
 | Payload length | 8 bytes | Size of the serialized index payload |
 | Log position | 8 bytes | Exact log boundary covered by the snapshot |
 | Payload | Variable | Serialized key-to-offset entries |
 | CRC-32 | 4 bytes | Detects accidental snapshot corruption |
-| End magic | 8 bytes | Validates the end marker |
+| End magic | 8 bytes | ASCII `KMINVEND` |
 
-The exact magic bytes and payload serialization must be finalized before implementing the snapshot codec.
+All integer fields use big-endian encoding. The payload begins with a
+big-endian uint32 entry count, followed by entries sorted lexicographically by
+raw key bytes. Each entry contains a uint32 key length, the key bytes and a
+uint64 record offset. The snapshot file is stored at `<log path>.index`.
 
 The checksum covers the version, payload length, log position and payload. The end marker is validated separately.
 
@@ -589,49 +626,75 @@ The checksum covers the version, payload length, log position and payload. The e
 
 The snapshot's log position must be the exact end boundary of the log prefix represented by the snapshot. It must never point into the middle of a record or beyond the valid log end.
 
-Every stored offset must be within the relevant log boundary and must refer to a valid record for the associated key.
+Every stored offset must be within the relevant log boundary and must refer to
+an existing record boundary containing a valid `SET` record for the associated
+key. Keys retain the existing 1,024-byte limit and may contain arbitrary bytes,
+including zero bytes.
 
 A snapshot must not be trusted solely because its own checksum is valid. Its metadata, entries and relationship to the authoritative log must also be checked.
 
-**Important correctness constraint:** skipping the log prefix and replaying only the suffix cannot, by itself, detect corruption in the skipped prefix. Therefore, the initial implementation must validate the required log prefix before relying on a snapshot. A future optimization that avoids this scan requires a separately designed and documented integrity strategy.
+**Important correctness constraint:** the implementation validates the complete
+authoritative log before relying on a snapshot. Skipping the log prefix and
+replaying only the suffix cannot, by itself, detect corruption in the skipped
+prefix.
 
 ### 12.3 Snapshot loading
 
 At startup:
 
-1. Validate snapshot structure, version, length and checksum.
-2. Validate its log position and index entries.
-3. Validate the relevant authoritative log data and snapshot consistency.
-4. If valid, use the snapshot and replay any valid suffix.
-5. If missing or invalid, rebuild the index from the log.
-6. If the authoritative log is corrupt, fail startup rather than allowing the snapshot to conceal the problem.
+1. Recover and validate the complete authoritative log first.
+2. Validate snapshot structure, version, length and checksum.
+3. Validate its log position and index entries against validated record
+   boundaries.
+4. Decode each referenced record and require a matching `SET`.
+5. Replay the exact log prefix through the snapshot position into a temporary
+   index and compare it with the snapshot index.
+6. If valid, install the snapshot index and replay the suffix through the
+   validated log end.
+7. If missing or invalid, rebuild the index from the full recovered log. Snapshot
+read, decode and consistency failures are treated as disposable derived-state
+failures; they do not alter an otherwise valid log.
+8. If the authoritative log is corrupt, fail startup rather than allowing the
+   snapshot to conceal the problem.
 
 A snapshot must never convert unrecoverable log corruption into a successful startup.
 
 ### 12.4 Snapshot writing
 
-Snapshots are written only during graceful shutdown in V1.
+Snapshots are written only during graceful shutdown in V1, at
+`<log path>.index`.
 
-The intended procedure is:
+The implemented procedure is:
 
 1. Serialize a consistent index and its exact log position.
 2. Write to a temporary snapshot file.
 3. Synchronize the temporary file.
 4. Close it and check for errors.
-5. Atomically replace the published snapshot using a replacement method supported by the target platform.
-6. Synchronize the parent directory where supported and required.
+5. Atomically replace the published snapshot using `os.Rename` on Unix-like
+   systems and Windows `ReplaceFileW`/`MoveFileExW` helpers on Windows.
+6. Synchronize the parent directory on Unix-like systems. Windows treats this
+   operation as unsupported.
 
-The old published snapshot must remain intact until the new snapshot is ready to replace it.
+The old published snapshot is not deleted during preparation. Existing tests
+cover preservation when preparation or publication is rejected before the
+native replacement call; preservation after a native replacement-call failure
+is platform-dependent and is not independently injected by the current test
+suite.
 
-A failed snapshot write must not invalidate the authoritative log. Snapshot errors must be reported by `Close`.
+A failed snapshot write must not invalidate the authoritative log. Temporary
+files are cleaned up without deleting the published snapshot. Snapshot errors
+are reported by `Close`, which still attempts to close the log. If mutation
+failure has already placed the database in its failed state, `Close` skips
+snapshot persistence and closes the log.
 
 The implementation must also ensure that the index and log position represent one consistent state.
 
 ### 12.5 Scope and trade-off
 
-Snapshots are included in the planned architecture, but their consistency rules must be implemented and tested carefully. Because V1 validates the relevant log prefix, the initial snapshot implementation may reduce index reconstruction work without eliminating the cost of scanning the log.
-
-A larger startup-speed improvement is a future optimization, not a guarantee of the first implementation.
+Snapshots reduce index replay work when valid, but startup still validates the
+complete authoritative log before trusting one. They therefore do not eliminate
+the cost of scanning the log. Snapshot files are disposable derived state and
+are never authoritative.
 
 ---
 
@@ -761,13 +824,17 @@ Test:
 
 - Valid snapshot creation and loading.
 - Missing and corrupted snapshots.
+- Fallback to full index reconstruction.
 - Unsupported snapshot versions.
 - Invalid lengths and checksums.
 - Invalid offsets and key-to-record mismatches.
 - Snapshot positions that fall inside records.
-- Crash-safe replacement behavior where testable.
+- Replacement of an existing snapshot on a second close.
+- Preservation of the previous published snapshot when persistence fails.
+- Recoverable log tails alongside a snapshot.
 - Corrupt authoritative log data that must not be hidden by a snapshot.
 - Replay of mutations appended after a snapshot boundary.
+- Terminal shutdown and log closure when snapshot persistence fails.
 
 ### 15.7 Failure injection
 
@@ -795,17 +862,35 @@ The tests must validate both race freedom and logical correctness. A race-free p
 
 ### 15.9 Benchmarks
 
-Establish baselines for:
+Run the standard-library benchmarks with:
 
-- Set throughput.
-- Get throughput.
-- Delete throughput.
-- Average and tail operation latency where measurable.
-- Memory usage as the number of keys grows.
-- Startup and recovery time for different log sizes.
-- Startup with and without a usable snapshot.
+```text
+go test -run '^$' -bench . -benchmem -count=3 ./...
+```
 
-Performance claims must be supported by reproducible measurements.
+`db_bench_test.go` uses deterministic 16-byte keys and 256-byte values.
+`BenchmarkDBSet` measures overwriting an existing key; each appended record
+is truncated and synced outside the timed region so log growth does not
+change the workload. `BenchmarkDBGetExisting`,
+`BenchmarkDBGetMissing`, and `BenchmarkDBDeleteExisting` measure the
+corresponding single-key operations with allocations reported.
+
+`BenchmarkDBGetScaling` uses 1,000, 10,000 and 100,000 populated keys.
+`BenchmarkDBIndexHeapPerKey` reports an approximate process heap delta per
+retained index key after a forced garbage collection. This is not an exact
+map-size measurement and is affected by Go runtime noise, allocator behavior,
+and filesystem-related memory.
+
+`BenchmarkDBOpenWithoutSnapshot` and `BenchmarkDBOpenWithSnapshot` use the
+same deterministic fixtures at those key counts. Fixture creation is outside
+the timed region; the former removes the sidecar before each open, while the
+latter retains a valid sidecar. Startup still validates the complete
+authoritative log, so a snapshot reduces index reconstruction work but does
+not eliminate the log scan.
+
+Benchmarks are baselines, not pass/fail tests. Results must be reported with
+the benchmark names, workload sizes, Go/runtime and operating-system
+environment, and the limitations of filesystem and memory measurements.
 
 ---
 
@@ -861,7 +946,9 @@ Work incrementally. Every milestone should compile and have tests before the nex
 - Establish the snapshot-to-log consistency strategy.
 - Test corruption and restart behavior.
 
-**Exit criterion:** A snapshot cannot conceal log corruption or produce an incorrect logical state.
+**Exit criterion:** A snapshot cannot conceal log corruption or produce an
+incorrect logical state. Implemented, including startup loading, suffix replay,
+safe shutdown persistence, fallback and platform-specific replacement.
 
 ### Milestone 6 — Concurrency and hardening
 
@@ -870,7 +957,10 @@ Work incrementally. Every milestone should compile and have tests before the nex
 - Run the race detector.
 - Exercise failure paths and input boundaries.
 
-**Exit criterion:** Supported concurrent use is correct, and failures do not silently corrupt the logical state.
+**Exit criterion:** Supported concurrent use is covered by existing tests and
+failure paths do not silently corrupt logical state. Race-detector verification
+remains outstanding in the current Windows environment because the installed C
+compiler cannot build 64-bit `runtime/cgo` code.
 
 ### Milestone 7 — Performance baseline
 
@@ -897,10 +987,15 @@ kminv/
 ├── record_test.go
 ├── log_test.go
 ├── recovery_test.go
-└── snapshot_test.go
+├── snapshot_test.go
+├── snapshot_replace_unix.go
+├── snapshot_replace_windows.go
+├── snapshot_dirsync_unix.go
+└── snapshot_dirsync_windows.go
 ```
 
-The snapshot files may be introduced at Milestone 5 rather than created immediately.
+The snapshot and platform-specific persistence files were introduced at
+Milestone 5.
 
 Keep the implementation in one package initially. Split packages only when there is a concrete benefit to the separation.
 
@@ -936,7 +1031,9 @@ Holding one mutex across disk operations limits concurrent throughput.
 
 A snapshot cannot prove that an unexamined log prefix is intact.
 
-**Decision:** Validate the relevant authoritative log data before trusting a snapshot. Any later shortcut needs an explicit integrity design.
+**Decision:** Validate the complete authoritative log before trusting a snapshot,
+then replay only the suffix after a consistent snapshot. This reduces index
+reconstruction work but not the complete validation scan.
 
 ### Platform-dependent durability
 
@@ -950,20 +1047,30 @@ Atomic replacement and directory synchronization differ across operating systems
 
 kminv V1 is complete when:
 
-- [ ] The public API supports Set, Get and Delete.
-- [ ] Data persists across normal restarts.
-- [ ] The binary format is explicitly defined and validated.
-- [ ] The in-memory index stores only key-to-offset mappings.
-- [ ] Empty values are distinct from missing keys.
-- [ ] Recoverable incomplete tails are truncated safely.
-- [ ] Unrecoverable corruption causes startup to fail.
-- [ ] Failed writes do not advance the index.
-- [ ] Uncertain rollback causes the instance to reject further operations.
-- [ ] Concurrent use of a single instance is synchronized.
-- [ ] Snapshot consistency and corruption behavior are tested.
-- [ ] The test suite and race detector pass.
-- [ ] Benchmarks provide a reproducible performance baseline.
-- [ ] Known limitations and durability assumptions are documented.
+- [x] The public API supports Set, Get and Delete.
+- [x] Data persists across normal restarts.
+- [x] The binary format is explicitly defined and validated.
+- [x] The in-memory index stores only key-to-offset mappings.
+- [x] Empty values are distinct from missing keys.
+- [x] Recoverable incomplete tails are truncated safely.
+- [x] Unrecoverable corruption causes startup to fail.
+- [x] Failed writes do not advance the index; failure-path tests cover this
+  behavior.
+- [x] Uncertain rollback causes the instance to reject further operations;
+  failure-path tests cover this behavior.
+- [x] Concurrent use of a single instance is synchronized and covered by
+  ordinary tests; race-detector verification remains separate.
+- [x] Snapshot consistency and corruption behavior are covered by ordinary
+  tests.
+- [ ] The regular test suite and race detector pass in all target environments.
+- [x] Benchmarks provide a reproducible performance baseline.
+- [x] Known limitations and durability assumptions are documented.
+
+The regular suite currently passes in the development environment. The race
+suite remains unverified there because the installed C compiler reports
+`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in` while building
+`runtime/cgo`. Benchmarks and final cross-environment verification remain
+outstanding, so V1 is not yet marked complete.
 
 ---
 
