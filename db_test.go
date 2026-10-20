@@ -274,8 +274,27 @@ func TestDBDeleteNonexistentKey(t *testing.T) {
 	db := openTestDB(t, filepath.Join(t.TempDir(), "data.log"))
 	defer db.Close()
 
+	before, err := db.log.file.Stat()
+	if err != nil {
+		t.Fatalf("Stat() before Delete() error = %v", err)
+	}
+	syncCalls := 0
+	db.syncLog = func() error {
+		syncCalls++
+		return errors.New("sync should not be called")
+	}
 	if err := db.Delete([]byte("missing")); err != nil {
 		t.Fatalf("Delete() error = %v", err)
+	}
+	after, err := db.log.file.Stat()
+	if err != nil {
+		t.Fatalf("Stat() after Delete() error = %v", err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("log size after Delete() = %d, want unchanged size %d", after.Size(), before.Size())
+	}
+	if syncCalls != 0 {
+		t.Fatalf("sync calls = %d, want 0", syncCalls)
 	}
 	if _, ok, err := db.Get([]byte("missing")); err != nil {
 		t.Fatalf("Get() error = %v", err)

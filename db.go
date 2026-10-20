@@ -125,7 +125,7 @@ func (db *DB) Set(key, value []byte) error {
 	return nil
 }
 
-// Delete is idempotent: it appends a DELETE record even when the key is absent.
+// Delete is idempotent: deleting an absent key succeeds without appending.
 func (db *DB) Delete(key []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -136,7 +136,6 @@ func (db *DB) Delete(key []byte) error {
 	if db.failed != nil {
 		return fmt.Errorf("database has failed: %w", db.failed)
 	}
-
 	record := Record{
 		Op:  OpDelete,
 		Key: append([]byte(nil), key...),
@@ -144,6 +143,9 @@ func (db *DB) Delete(key []byte) error {
 	data, err := encodeRecord(record)
 	if err != nil {
 		return fmt.Errorf("encode DELETE record: %w", err)
+	}
+	if _, ok := db.index[string(record.Key)]; !ok {
+		return nil
 	}
 
 	info, err := db.log.file.Stat()
