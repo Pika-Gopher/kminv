@@ -3,6 +3,7 @@ package kminv
 import (
 	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -530,6 +531,224 @@ func TestDBSetPersistsAcrossReopen(t *testing.T) {
 	}
 	if !ok || !bytes.Equal(value, []byte("value")) {
 		t.Fatalf("Get() = (%q, %t), want (%q, true)", value, ok, "value")
+	}
+}
+
+func TestDBClosePersistsSnapshotAndReopensBinaryState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	db := openTestDB(t, path)
+	key := []byte{0x00, 0xff, 0x01}
+	value := []byte{0x00, 0xfe, 0x02}
+	if err := db.Set(key, value); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	snapshotData, err := os.ReadFile(path + ".index")
+	if err != nil {
+		t.Fatalf("ReadFile(snapshot) error = %v", err)
+	}
+	if _, err := decodeSnapshot(snapshotData); err != nil {
+		t.Fatalf("decodeSnapshot() error = %v", err)
+	}
+
+	db = openTestDB(t, path)
+	defer db.Close()
+	got, ok, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok || !bytes.Equal(got, value) {
+		t.Fatalf("Get() = (%v, %t), want (%v, true)", got, ok, value)
+	}
+}
+
+func TestDBCloseReplacesExistingSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	db := openTestDB(t, path)
+	if err := db.Set([]byte("key"), []byte("old")); err != nil {
+		t.Fatalf("first Set() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+
+	db = openTestDB(t, path)
+	if err := db.Set([]byte("key"), []byte("new")); err != nil {
+		t.Fatalf("second Set() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+
+	data, err := os.ReadFile(path + ".index")
+	if err != nil {
+		t.Fatalf("ReadFile(snapshot) error = %v", err)
+	}
+	s, err := decodeSnapshot(data)
+	if err != nil {
+		t.Fatalf("decodeSnapshot() error = %v", err)
+	}
+	db = openTestDB(t, path)
+	defer db.Close()
+	if err := db.validateSnapshot(s); err != nil {
+		t.Fatalf("validateSnapshot() error = %v", err)
+	}
+	value, ok, err := db.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok || string(value) != "new" {
+		t.Fatalf("Get() = (%q, %t), want (%q, true)", value, ok, "new")
+	}
+}
+
+func TestDBOpenFallsBackFromMalformedSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	writeRecoveryRecords(t, path, []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("value")}})
+	if err := os.WriteFile(path+".index", []byte("malformed"), 0o644); err != nil {
+		t.Fatalf("WriteFile(snapshot) error = %v", err)
+	}
+
+	db := openTestDB(t, path)
+	defer db.Close()
+	got, ok, err := db.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok || string(got) != "value" {
+		t.Fatalf("Get() = (%q, %t), want (%q, true)", got, ok, "value")
+	}
+}
+
+func TestDBOpenLoadsSnapshotAndReplaysSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	prefix := []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("old")}}
+	offsets := writeRecoveryRecords(t, path, prefix)
+	prefixEnd := offsets[0] + int64(len(encodedRecoveryRecord(t, prefix[0])))
+	snapshotData, err := encodeSnapshot(snapshot{logPosition: prefixEnd, index: map[string]int64{"key": offsets[0]}})
+	if err != nil {
+		t.Fatalf("encodeSnapshot() error = %v", err)
+	}
+	if err := os.WriteFile(path+".index", snapshotData, 0o644); err != nil {
+		t.Fatalf("WriteFile(snapshot) error = %v", err)
+	}
+	appendRecoveryBytes(t, path, encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("new")}))
+	appendRecoveryBytes(t, path, encodedRecoveryRecord(t, Record{Op: OpDelete, Key: []byte("other")}))
+
+	db := openTestDB(t, path)
+	defer db.Close()
+	got, ok, err := db.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !ok || string(got) != "new" {
+		t.Fatalf("Get() = (%q, %t), want (%q, true)", got, ok, "new")
+	}
+}
+
+func TestDBOpenRecoversTailWithSnapshotPresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")}
+	offsets := writeRecoveryRecords(t, path, []Record{record})
+	end := offsets[0] + int64(len(encodedRecoveryRecord(t, record)))
+	data, err := encodeSnapshot(snapshot{logPosition: end, index: map[string]int64{"key": offsets[0]}})
+	if err != nil {
+		t.Fatalf("encodeSnapshot() error = %v", err)
+	}
+	if err := os.WriteFile(path+".index", data, 0o644); err != nil {
+		t.Fatalf("WriteFile(snapshot) error = %v", err)
+	}
+	appendRecoveryBytes(t, path, []byte{0, 0, 0})
+
+	db := openTestDB(t, path)
+	defer db.Close()
+	if got, ok, err := db.Get([]byte("key")); err != nil || !ok || string(got) != "value" {
+		t.Fatalf("Get() = (%q, %t, %v), want (%q, true, nil)", got, ok, err, "value")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(log) error = %v", err)
+	}
+	if info.Size() != end {
+		t.Fatalf("log size = %d, want recovered end %d", info.Size(), end)
+	}
+}
+
+func TestDBCloseSnapshotFailureStillClosesAndIsTerminal(t *testing.T) {
+	db := openTestDB(t, filepath.Join(t.TempDir(), "data.log"))
+	snapshotFailure := errors.New("injected snapshot failure")
+	closeCalled := false
+	db.persistSnapshot = func(snapshot) error {
+		return snapshotFailure
+	}
+	db.closeLog = func() error {
+		closeCalled = true
+		return db.log.close()
+	}
+
+	err := db.Close()
+	if !errors.Is(err, snapshotFailure) {
+		t.Fatalf("Close() error = %v, want snapshot failure", err)
+	}
+	if !closeCalled {
+		t.Fatal("Close() did not attempt to close the log")
+	}
+	if _, _, err := db.Get([]byte("key")); err == nil {
+		t.Fatal("Get() error = nil after failed Close, want terminal error")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("repeated Close() error = %v, want nil", err)
+	}
+}
+
+func TestDBCloseLogFailureIsTerminal(t *testing.T) {
+	db := openTestDB(t, filepath.Join(t.TempDir(), "data.log"))
+	closeFailure := errors.New("injected close failure")
+	db.closeLog = func() error {
+		return closeFailure
+	}
+	if err := db.Close(); !errors.Is(err, closeFailure) {
+		t.Fatalf("Close() error = %v, want close failure", err)
+	}
+	if err := db.Set([]byte("key"), []byte("value")); err == nil {
+		t.Fatal("Set() error = nil after failed Close, want terminal error")
+	}
+	if err := db.log.close(); err != nil {
+		t.Fatalf("cleanup log close error = %v", err)
+	}
+}
+
+func TestDBSnapshotFailurePreservesPublishedSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	db := openTestDB(t, path)
+	if err := db.Set([]byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("initial Close() error = %v", err)
+	}
+	before, err := os.ReadFile(path + ".index")
+	if err != nil {
+		t.Fatalf("ReadFile(initial snapshot) error = %v", err)
+	}
+
+	db = openTestDB(t, path)
+	snapshotFailure := errors.New("injected replacement failure")
+	db.persistSnapshot = func(snapshot) error {
+		return snapshotFailure
+	}
+	if err := db.Close(); !errors.Is(err, snapshotFailure) {
+		t.Fatalf("Close() error = %v, want replacement failure", err)
+	}
+	after, err := os.ReadFile(path + ".index")
+	if err != nil {
+		t.Fatalf("ReadFile(published snapshot) error = %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("published snapshot changed after failed publication")
 	}
 }
 

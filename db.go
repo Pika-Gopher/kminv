@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 )
@@ -16,8 +17,10 @@ type DB struct {
 	closed bool
 	failed error
 
-	syncLog     func() error
-	truncateLog func(int64) error
+	syncLog         func() error
+	truncateLog     func(int64) error
+	persistSnapshot func(snapshot) error
+	closeLog        func() error
 }
 
 func Open(path string) (*DB, error) {
@@ -31,10 +34,28 @@ func Open(path string) (*DB, error) {
 		index:       make(map[string]int64),
 		syncLog:     log.sync,
 		truncateLog: log.truncate,
+		persistSnapshot: func(s snapshot) error {
+			return writeSnapshot(log.path+".index", s)
+		},
+		closeLog: log.close,
 	}
-	if err := db.recover(); err != nil {
+	validation, err := db.recover()
+	if err != nil {
 		_ = log.close()
 		return nil, fmt.Errorf("recover database: %w", err)
+	}
+	if data, err := os.ReadFile(log.path + ".index"); err == nil {
+		if s, err := decodeSnapshot(data); err == nil {
+			if err := db.validateSnapshotWith(s, validation); err == nil {
+				db.index = cloneIndex(s.index)
+				if err := db.replayRange(s.logPosition, validation.end, db.index); err != nil {
+					_ = log.close()
+					return nil, fmt.Errorf("replay snapshot suffix: %w", err)
+				}
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		// Snapshot I/O failures are disposable derived-state failures.
 	}
 	return db, nil
 }
@@ -46,11 +67,21 @@ func (db *DB) Close() error {
 	if db.closed {
 		return nil
 	}
-	if err := db.log.close(); err != nil {
-		return err
-	}
 	db.closed = true
-	return nil
+	var snapshotErr error
+	if db.failed == nil {
+		info, err := db.log.file.Stat()
+		if err != nil {
+			snapshotErr = fmt.Errorf("stat log for snapshot: %w", err)
+		} else {
+			snapshotErr = db.persistSnapshot(snapshot{
+				logPosition: info.Size(),
+				index:       cloneIndex(db.index),
+			})
+		}
+	}
+	closeErr := db.closeLog()
+	return errors.Join(snapshotErr, closeErr)
 }
 
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
@@ -179,8 +210,8 @@ func (db *DB) rollbackMutation(previousEnd int64, operationErr error) error {
 	return operationErr
 }
 
-func (db *DB) recover() error {
-	_, err := db.scanLog(0, true, false, func(offset int64, record Record) {
+func (db *DB) recover() (logValidation, error) {
+	validation, err := db.scanLog(0, true, true, func(offset int64, record Record) {
 		switch record.Op {
 		case OpSet:
 			db.index[string(record.Key)] = offset
@@ -188,7 +219,7 @@ func (db *DB) recover() error {
 			delete(db.index, string(record.Key))
 		}
 	})
-	return err
+	return validation, err
 }
 
 type logValidation struct {
@@ -205,6 +236,10 @@ func (db *DB) validateSnapshot(s snapshot) error {
 	if err != nil {
 		return fmt.Errorf("validate authoritative log: %w", err)
 	}
+	return db.validateSnapshotWith(s, validation)
+}
+
+func (db *DB) validateSnapshotWith(s snapshot, validation logValidation) error {
 	if s.logPosition > validation.end {
 		return fmt.Errorf("snapshot log position %d exceeds validated log end %d", s.logPosition, validation.end)
 	}
@@ -233,20 +268,33 @@ func (db *DB) validateSnapshot(s snapshot) error {
 	}
 
 	prefixIndex := make(map[string]int64)
-	if _, err := db.scanLog(s.logPosition, false, false, func(offset int64, record Record) {
-		switch record.Op {
-		case OpSet:
-			prefixIndex[string(record.Key)] = offset
-		case OpDelete:
-			delete(prefixIndex, string(record.Key))
-		}
-	}); err != nil {
+	if err := db.replayRange(logHeaderSize, s.logPosition, prefixIndex); err != nil {
 		return fmt.Errorf("replay log prefix for snapshot: %w", err)
 	}
 	if !indexesEqual(prefixIndex, s.index) {
 		return fmt.Errorf("snapshot index does not match log prefix at position %d", s.logPosition)
 	}
 	return nil
+}
+
+func (db *DB) replayRange(start, end int64, index map[string]int64) error {
+	_, err := db.scanLogRange(start, end, false, false, func(offset int64, record Record) {
+		switch record.Op {
+		case OpSet:
+			index[string(record.Key)] = offset
+		case OpDelete:
+			delete(index, string(record.Key))
+		}
+	})
+	return err
+}
+
+func cloneIndex(index map[string]int64) map[string]int64 {
+	clone := make(map[string]int64, len(index))
+	for key, offset := range index {
+		clone[key] = offset
+	}
+	return clone
 }
 
 func indexesEqual(left, right map[string]int64) bool {
@@ -262,6 +310,10 @@ func indexesEqual(left, right map[string]int64) bool {
 }
 
 func (db *DB) scanLog(limit int64, recoverTail bool, collectBoundaries bool, apply func(int64, Record)) (logValidation, error) {
+	return db.scanLogRange(logHeaderSize, limit, recoverTail, collectBoundaries, apply)
+}
+
+func (db *DB) scanLogRange(start, limit int64, recoverTail bool, collectBoundaries bool, apply func(int64, Record)) (logValidation, error) {
 	info, err := db.log.file.Stat()
 	if err != nil {
 		return logValidation{}, fmt.Errorf("stat log for recovery: %w", err)
@@ -274,7 +326,10 @@ func (db *DB) scanLog(limit int64, recoverTail bool, collectBoundaries bool, app
 		end = limit
 	}
 
-	offset := int64(logHeaderSize)
+	if start < logHeaderSize || start > end {
+		return logValidation{}, fmt.Errorf("invalid log scan start %d", start)
+	}
+	offset := start
 	var boundaries []int64
 	if collectBoundaries {
 		boundaries = append(boundaries, offset)

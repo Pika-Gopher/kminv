@@ -3,9 +3,12 @@ package kminv
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 )
 
@@ -154,4 +157,57 @@ func decodeSnapshot(data []byte) (snapshot, error) {
 		return snapshot{}, fmt.Errorf("snapshot payload has trailing data")
 	}
 	return result, nil
+}
+
+func writeSnapshot(path string, s snapshot) error {
+	data, err := encodeSnapshot(s)
+	if err != nil {
+		return fmt.Errorf("encode snapshot: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create snapshot temporary file: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := func(primary error) error {
+		if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+			return errors.Join(primary, fmt.Errorf("remove snapshot temporary file: %w", err))
+		}
+		return primary
+	}
+
+	if err := writeAll(temp, data); err != nil {
+		_ = temp.Close()
+		return cleanup(fmt.Errorf("write snapshot temporary file: %w", err))
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return cleanup(fmt.Errorf("sync snapshot temporary file: %w", err))
+	}
+	if err := temp.Close(); err != nil {
+		return cleanup(fmt.Errorf("close snapshot temporary file: %w", err))
+	}
+	if err := replaceSnapshot(path, tempPath); err != nil {
+		return cleanup(fmt.Errorf("publish snapshot: %w", err))
+	}
+	if err := syncSnapshotDirectory(dir); err != nil {
+		return fmt.Errorf("sync snapshot directory: %w", err)
+	}
+	return nil
+}
+
+func writeAll(file *os.File, data []byte) error {
+	for len(data) > 0 {
+		n, err := file.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("short write: wrote 0 bytes")
+		}
+		data = data[n:]
+	}
+	return nil
 }

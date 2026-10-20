@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -334,6 +335,27 @@ func TestValidateSnapshotDoesNotTruncateIncompleteTail(t *testing.T) {
 		t.Fatalf("close() error = %v", err)
 	}
 	assertFileSize(t, path, before)
+}
+
+func TestOpenRejectsCorruptLogWhenSnapshotExists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+	offsets := writeRecoveryRecords(t, path, []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("value")}})
+	end := offsets[0] + int64(len(record))
+	snapshotData, err := encodeSnapshot(snapshot{logPosition: end, index: map[string]int64{"key": offsets[0]}})
+	if err != nil {
+		t.Fatalf("encodeSnapshot() error = %v", err)
+	}
+	if err := os.WriteFile(path+".index", snapshotData, 0o644); err != nil {
+		t.Fatalf("WriteFile(snapshot) error = %v", err)
+	}
+	record[4] ^= 0xff
+	appendRecoveryBytes(t, path, record)
+
+	if db, err := Open(path); err == nil {
+		_ = db.Close()
+		t.Fatal("Open() error = nil, want authoritative log corruption error")
+	}
 }
 
 func encodedTestSnapshot(t *testing.T) []byte {
