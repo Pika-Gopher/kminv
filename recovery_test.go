@@ -206,7 +206,7 @@ func TestValidateLogReturnsRecordBoundariesAndEnd(t *testing.T) {
 	}
 }
 
-func TestValidateLogTruncatesOnlyIncompleteFinalTails(t *testing.T) {
+func TestValidateLogRejectsIncompleteFinalTailsWithoutTruncating(t *testing.T) {
 	tests := []struct {
 		name string
 		tail []byte
@@ -235,22 +235,81 @@ func TestValidateLogTruncatesOnlyIncompleteFinalTails(t *testing.T) {
 				t.Fatalf("openLog() error = %v", err)
 			}
 			db := &DB{log: log}
-			validation, err := db.validateLog()
-			if err != nil {
+			if _, err := db.validateLog(); err == nil {
 				_ = log.close()
-				t.Fatalf("validateLog() error = %v", err)
+				t.Fatal("validateLog() error = nil, want incomplete-tail error")
 			}
 			if err := log.close(); err != nil {
 				t.Fatalf("Close() error = %v", err)
 			}
 
-			wantEnd := offsets[0] + int64(len(record))
-			if validation.end != wantEnd {
-				t.Fatalf("validation end = %d, want %d", validation.end, wantEnd)
-			}
-			assertFileSize(t, path, wantEnd)
+			wantSize := offsets[0] + int64(len(record)) + int64(len(test.tail))
+			assertFileSize(t, path, wantSize)
 		})
 	}
+}
+
+func TestBoundedScanDoesNotTruncateIncompleteTail(t *testing.T) {
+	tests := []struct {
+		name string
+		tail []byte
+	}{
+		{name: "incomplete prefix", tail: []byte{0, 0, 0}},
+		{
+			name: "incomplete body",
+			tail: func() []byte {
+				tail := make([]byte, 4+5)
+				binary.BigEndian.PutUint32(tail[:4], 13)
+				copy(tail[4:], []byte{OpSet, 0, 0, 0, 0})
+				return tail
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.log")
+			record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+			offsets := writeRecoveryRecords(t, path, []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("value")}})
+			appendRecoveryBytes(t, path, test.tail)
+			before := offsets[0] + int64(len(record)) + int64(len(test.tail))
+
+			log, err := openLog(path)
+			if err != nil {
+				t.Fatalf("openLog() error = %v", err)
+			}
+			db := &DB{log: log}
+			if _, err := db.scanLog(before, false, false, nil); err == nil {
+				_ = log.close()
+				t.Fatal("bounded scan error = nil, want incomplete-tail error")
+			}
+			if err := log.close(); err != nil {
+				t.Fatalf("close() error = %v", err)
+			}
+			assertFileSize(t, path, before)
+		})
+	}
+}
+
+func TestBoundedScanRejectsInteriorLimitWithoutTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+	offsets := writeRecoveryRecords(t, path, []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("value")}})
+	before := offsets[0] + int64(len(record))
+
+	log, err := openLog(path)
+	if err != nil {
+		t.Fatalf("openLog() error = %v", err)
+	}
+	db := &DB{log: log}
+	if _, err := db.scanLog(offsets[0]+1, false, false, nil); err == nil {
+		_ = log.close()
+		t.Fatal("bounded scan error = nil, want interior-boundary error")
+	}
+	if err := log.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+	assertFileSize(t, path, before)
 }
 
 func TestOpenDoesNotSkipCompleteCorruption(t *testing.T) {

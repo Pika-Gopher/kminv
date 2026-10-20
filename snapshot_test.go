@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"path/filepath"
 	"testing"
 )
 
@@ -189,6 +190,150 @@ func TestSnapshotEncodeRejectsInvalidMetadata(t *testing.T) {
 			t.Fatalf("encodeSnapshot(%#v) error = nil, want error", test)
 		}
 	}
+}
+
+func TestValidateSnapshotAcceptsMatchingPrefixAndSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	records := []Record{
+		{Op: OpSet, Key: []byte("key"), Value: []byte("old")},
+		{Op: OpSet, Key: []byte("key"), Value: []byte("new")},
+	}
+	offsets := writeRecoveryRecords(t, path, records)
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	prefixEnd := offsets[0] + int64(len(encodedRecoveryRecord(t, records[0])))
+	s := snapshot{logPosition: prefixEnd, index: map[string]int64{"key": offsets[0]}}
+	if err := db.validateSnapshot(s); err != nil {
+		t.Fatalf("validateSnapshot() error = %v", err)
+	}
+}
+
+func TestValidateSnapshotAcceptsEmptyAndBinaryKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	records := []Record{
+		{Op: OpSet, Key: []byte{}, Value: []byte{}},
+		{Op: OpSet, Key: []byte{0x00, 0xff, 0x01}, Value: []byte{0x00, 0xfe}},
+	}
+	offsets := writeRecoveryRecords(t, path, records)
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	end := offsets[1] + int64(len(encodedRecoveryRecord(t, records[1])))
+	s := snapshot{logPosition: end, index: map[string]int64{
+		"":                               offsets[0],
+		string([]byte{0x00, 0xff, 0x01}): offsets[1],
+	}}
+	if err := db.validateSnapshot(s); err != nil {
+		t.Fatalf("validateSnapshot() error = %v", err)
+	}
+}
+
+func TestValidateSnapshotRejectsInvalidPositionsAndOffsets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")}
+	offsets := writeRecoveryRecords(t, path, []Record{record})
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	end := offsets[0] + int64(len(encodedRecoveryRecord(t, record)))
+	tests := []snapshot{
+		{logPosition: logHeaderSize + 1},
+		{logPosition: end + 1},
+		{logPosition: end, index: map[string]int64{"key": offsets[0] + 1}},
+		{logPosition: end, index: map[string]int64{"key": end}},
+		{logPosition: offsets[0], index: map[string]int64{"key": offsets[0]}},
+	}
+	for i, test := range tests {
+		if err := db.validateSnapshot(test); err == nil {
+			t.Errorf("case %d: validateSnapshot() error = nil, want error", i)
+		}
+	}
+}
+
+func TestValidateSnapshotRejectsWrongRecordAndSemanticMismatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	records := []Record{
+		{Op: OpSet, Key: []byte("key"), Value: []byte("old")},
+		{Op: OpSet, Key: []byte("other"), Value: []byte("value")},
+		{Op: OpDelete, Key: []byte("key")},
+	}
+	offsets := writeRecoveryRecords(t, path, records)
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+	end := offsets[2] + int64(len(encodedRecoveryRecord(t, records[2])))
+
+	tests := []snapshot{
+		{logPosition: end, index: map[string]int64{"key": offsets[2]}},
+		{logPosition: end, index: map[string]int64{"key": offsets[1]}},
+		{logPosition: end, index: map[string]int64{"key": offsets[0]}},
+		{logPosition: end, index: map[string]int64{"key": offsets[0], "other": offsets[1]}},
+	}
+	for i, test := range tests {
+		if err := db.validateSnapshot(test); err == nil {
+			t.Errorf("case %d: validateSnapshot() error = nil, want error", i)
+		}
+	}
+}
+
+func TestValidateSnapshotReportsAuthoritativeLogCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+	record[4] ^= 0xff
+	createRecoveryLog(t, path)
+	appendRecoveryBytes(t, path, record)
+
+	log, err := openLog(path)
+	if err != nil {
+		t.Fatalf("openLog() error = %v", err)
+	}
+	defer log.close()
+	db := &DB{log: log}
+	err = db.validateSnapshot(snapshot{logPosition: logHeaderSize, index: map[string]int64{}})
+	if err == nil {
+		t.Fatal("validateSnapshot() error = nil, want authoritative log corruption error")
+	}
+}
+
+func TestValidateSnapshotDoesNotTruncateIncompleteTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")}
+	offsets := writeRecoveryRecords(t, path, []Record{record})
+	encoded := encodedRecoveryRecord(t, record)
+	tail := []byte{0, 0, 0}
+	appendRecoveryBytes(t, path, tail)
+	before := offsets[0] + int64(len(encoded)) + int64(len(tail))
+
+	log, err := openLog(path)
+	if err != nil {
+		t.Fatalf("openLog() error = %v", err)
+	}
+	db := &DB{log: log}
+	prefixEnd := offsets[0] + int64(len(encoded))
+	err = db.validateSnapshot(snapshot{
+		logPosition: prefixEnd,
+		index:       map[string]int64{"key": offsets[0]},
+	})
+	if err == nil {
+		_ = log.close()
+		t.Fatal("validateSnapshot() error = nil, want incomplete-tail error")
+	}
+	if err := log.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+	assertFileSize(t, path, before)
 }
 
 func encodedTestSnapshot(t *testing.T) []byte {

@@ -180,7 +180,7 @@ func (db *DB) rollbackMutation(previousEnd int64, operationErr error) error {
 }
 
 func (db *DB) recover() error {
-	_, err := db.scanLog(false, func(offset int64, record Record) {
+	_, err := db.scanLog(0, true, false, func(offset int64, record Record) {
 		switch record.Op {
 		case OpSet:
 			db.index[string(record.Key)] = offset
@@ -197,13 +197,81 @@ type logValidation struct {
 }
 
 func (db *DB) validateLog() (logValidation, error) {
-	return db.scanLog(true, nil)
+	return db.scanLog(0, false, true, nil)
 }
 
-func (db *DB) scanLog(collectBoundaries bool, apply func(int64, Record)) (logValidation, error) {
+func (db *DB) validateSnapshot(s snapshot) error {
+	validation, err := db.validateLog()
+	if err != nil {
+		return fmt.Errorf("validate authoritative log: %w", err)
+	}
+	if s.logPosition > validation.end {
+		return fmt.Errorf("snapshot log position %d exceeds validated log end %d", s.logPosition, validation.end)
+	}
+	if !validation.hasBoundary(s.logPosition) {
+		return fmt.Errorf("snapshot log position %d is not a record boundary", s.logPosition)
+	}
+
+	for key, offset := range s.index {
+		if offset >= s.logPosition || !validation.hasBoundary(offset) {
+			return fmt.Errorf("snapshot offset %d for key is not a valid record boundary", offset)
+		}
+		data, err := db.log.readRecord(offset)
+		if err != nil {
+			return fmt.Errorf("read snapshot record at offset %d: %w", offset, err)
+		}
+		record, err := decodeRecord(data)
+		if err != nil {
+			return fmt.Errorf("decode snapshot record at offset %d: %w", offset, err)
+		}
+		if record.Op != OpSet {
+			return fmt.Errorf("snapshot entry for key points to a non-SET record at offset %d", offset)
+		}
+		if string(record.Key) != key {
+			return fmt.Errorf("snapshot entry key does not match record at offset %d", offset)
+		}
+	}
+
+	prefixIndex := make(map[string]int64)
+	if _, err := db.scanLog(s.logPosition, false, false, func(offset int64, record Record) {
+		switch record.Op {
+		case OpSet:
+			prefixIndex[string(record.Key)] = offset
+		case OpDelete:
+			delete(prefixIndex, string(record.Key))
+		}
+	}); err != nil {
+		return fmt.Errorf("replay log prefix for snapshot: %w", err)
+	}
+	if !indexesEqual(prefixIndex, s.index) {
+		return fmt.Errorf("snapshot index does not match log prefix at position %d", s.logPosition)
+	}
+	return nil
+}
+
+func indexesEqual(left, right map[string]int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, offset := range left {
+		if right[key] != offset {
+			return false
+		}
+	}
+	return true
+}
+
+func (db *DB) scanLog(limit int64, recoverTail bool, collectBoundaries bool, apply func(int64, Record)) (logValidation, error) {
 	info, err := db.log.file.Stat()
 	if err != nil {
 		return logValidation{}, fmt.Errorf("stat log for recovery: %w", err)
+	}
+	end := info.Size()
+	if limit != 0 {
+		if limit < logHeaderSize || limit > end {
+			return logValidation{}, fmt.Errorf("invalid log scan limit %d", limit)
+		}
+		end = limit
 	}
 
 	offset := int64(logHeaderSize)
@@ -211,9 +279,12 @@ func (db *DB) scanLog(collectBoundaries bool, apply func(int64, Record)) (logVal
 	if collectBoundaries {
 		boundaries = append(boundaries, offset)
 	}
-	for offset < info.Size() {
-		remaining := info.Size() - offset
+	for offset < end {
+		remaining := end - offset
 		if remaining < 4 {
+			if !recoverTail {
+				return logValidation{}, fmt.Errorf("log scan ended with an incomplete record at offset %d", offset)
+			}
 			if err := db.recoverTail(offset); err != nil {
 				return logValidation{}, err
 			}
@@ -229,6 +300,9 @@ func (db *DB) scanLog(collectBoundaries bool, apply func(int64, Record)) (logVal
 			return logValidation{}, fmt.Errorf("invalid record length %d at offset %d", recordLength, offset)
 		}
 		if int64(recordLength)+4 > remaining {
+			if !recoverTail {
+				return logValidation{}, fmt.Errorf("log scan limit %d is inside an incomplete record", limit)
+			}
 			if err := db.recoverTail(offset); err != nil {
 				return logValidation{}, err
 			}
