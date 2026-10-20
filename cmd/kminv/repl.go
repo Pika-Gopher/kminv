@@ -122,15 +122,15 @@ func parseArguments(line string) ([]string, error) {
 }
 
 func writeHelp(output io.Writer) error {
-	_, err := fmt.Fprintln(output,
-		"Commands:",
-		"  SET <key> <value>   Store a value",
-		"  GET <key>           Display a value",
-		"  DELETE <key>       Delete a key",
-		"  HAS <key>           Check whether a key exists",
-		"  HELP                Show this help message",
-		"  EXIT                Close the database and exit",
-		"  QUIT                Close the database and exit",
+	_, err := fmt.Fprint(output,
+		"Commands:\n",
+		"  SET <key> <value>   Store a value\n",
+		"  GET <key>           Display a value\n",
+		"  DELETE <key>        Delete a key\n",
+		"  HAS <key>           Check whether a key exists\n",
+		"  HELP                Show this help message\n",
+		"  EXIT                Close the database and exit\n",
+		"  QUIT                Close the database and exit\n",
 	)
 	if err != nil {
 		return fmt.Errorf("write help: %w", err)
