@@ -108,16 +108,8 @@ Run the race suite:
 go test -race -count=1 ./...
 ```
 
-The regular suite passes in the current development environment. The race
-suite could not be verified in the recorded Windows environment because the
-installed C compiler failed while building `runtime/cgo` with:
-
-```text
-cc1.exe: sorry, unimplemented: 64-bit mode not compiled in
-```
-
-This is a toolchain limitation, not an application test result. Results can
-vary with the local Go toolchain and platform.
+The regular and race suites pass in the current development Windows
+environment. Results can vary with the local Go toolchain and platform.
 
 ## Benchmark baseline
 
