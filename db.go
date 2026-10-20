@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -179,49 +180,85 @@ func (db *DB) rollbackMutation(previousEnd int64, operationErr error) error {
 }
 
 func (db *DB) recover() error {
-	info, err := db.log.file.Stat()
-	if err != nil {
-		return fmt.Errorf("stat log for recovery: %w", err)
-	}
-
-	offset := int64(logHeaderSize)
-	for offset < info.Size() {
-		remaining := info.Size() - offset
-		if remaining < 4 {
-			return db.recoverTail(offset)
-		}
-
-		var lengthPrefix [4]byte
-		if _, err := db.log.file.ReadAt(lengthPrefix[:], offset); err != nil {
-			return fmt.Errorf("read record length at offset %d: %w", offset, err)
-		}
-		recordLength := binary.BigEndian.Uint32(lengthPrefix[:])
-		if recordLength < 13 || recordLength > maxRecordLength {
-			return fmt.Errorf("invalid record length %d at offset %d", recordLength, offset)
-		}
-		if int64(recordLength)+4 > remaining {
-			return db.recoverTail(offset)
-		}
-
-		data, err := db.log.readRecord(offset)
-		if err != nil {
-			return fmt.Errorf("read record at offset %d: %w", offset, err)
-		}
-		record, err := decodeRecord(data)
-		if err != nil {
-			return fmt.Errorf("decode record at offset %d: %w", offset, err)
-		}
-
+	_, err := db.scanLog(false, func(offset int64, record Record) {
 		switch record.Op {
 		case OpSet:
 			db.index[string(record.Key)] = offset
 		case OpDelete:
 			delete(db.index, string(record.Key))
 		}
-		offset += int64(len(data))
+	})
+	return err
+}
+
+type logValidation struct {
+	end        int64
+	boundaries []int64
+}
+
+func (db *DB) validateLog() (logValidation, error) {
+	return db.scanLog(true, nil)
+}
+
+func (db *DB) scanLog(collectBoundaries bool, apply func(int64, Record)) (logValidation, error) {
+	info, err := db.log.file.Stat()
+	if err != nil {
+		return logValidation{}, fmt.Errorf("stat log for recovery: %w", err)
 	}
 
-	return nil
+	offset := int64(logHeaderSize)
+	var boundaries []int64
+	if collectBoundaries {
+		boundaries = append(boundaries, offset)
+	}
+	for offset < info.Size() {
+		remaining := info.Size() - offset
+		if remaining < 4 {
+			if err := db.recoverTail(offset); err != nil {
+				return logValidation{}, err
+			}
+			return logValidation{end: offset, boundaries: boundaries}, nil
+		}
+
+		var lengthPrefix [4]byte
+		if _, err := db.log.file.ReadAt(lengthPrefix[:], offset); err != nil {
+			return logValidation{}, fmt.Errorf("read record length at offset %d: %w", offset, err)
+		}
+		recordLength := binary.BigEndian.Uint32(lengthPrefix[:])
+		if recordLength < 13 || recordLength > maxRecordLength {
+			return logValidation{}, fmt.Errorf("invalid record length %d at offset %d", recordLength, offset)
+		}
+		if int64(recordLength)+4 > remaining {
+			if err := db.recoverTail(offset); err != nil {
+				return logValidation{}, err
+			}
+			return logValidation{end: offset, boundaries: boundaries}, nil
+		}
+
+		data, err := db.log.readRecord(offset)
+		if err != nil {
+			return logValidation{}, fmt.Errorf("read record at offset %d: %w", offset, err)
+		}
+		record, err := decodeRecord(data)
+		if err != nil {
+			return logValidation{}, fmt.Errorf("decode record at offset %d: %w", offset, err)
+		}
+
+		if apply != nil {
+			apply(offset, record)
+		}
+		offset += int64(len(data))
+		if collectBoundaries {
+			boundaries = append(boundaries, offset)
+		}
+	}
+
+	return logValidation{end: offset, boundaries: boundaries}, nil
+}
+
+func (v logValidation) hasBoundary(offset int64) bool {
+	index, found := slices.BinarySearch(v.boundaries, offset)
+	return found && v.boundaries[index] == offset
 }
 
 func (db *DB) recoverTail(offset int64) error {

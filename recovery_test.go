@@ -171,6 +171,102 @@ func TestOpenRejectsImpossibleRecordLengthDuringRecovery(t *testing.T) {
 	}
 }
 
+func TestValidateLogReturnsRecordBoundariesAndEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	offsets := writeRecoveryRecords(t, path, []Record{
+		{Op: OpSet, Key: []byte("one"), Value: []byte("1")},
+		{Op: OpSet, Key: []byte("two"), Value: []byte("2")},
+	})
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+
+	validation, err := db.validateLog()
+	if err != nil {
+		t.Fatalf("validateLog() error = %v", err)
+	}
+	wantEnd := offsets[1] + int64(len(encodedRecoveryRecord(t, Record{
+		Op: OpSet, Key: []byte("two"), Value: []byte("2"),
+	})))
+	if validation.end != wantEnd {
+		t.Fatalf("validation end = %d, want %d", validation.end, wantEnd)
+	}
+	for _, offset := range []int64{logHeaderSize, offsets[1], wantEnd} {
+		if !validation.hasBoundary(offset) {
+			t.Errorf("boundary %d is missing", offset)
+		}
+	}
+	for _, offset := range []int64{logHeaderSize + 1, offsets[1] + 1} {
+		if validation.hasBoundary(offset) {
+			t.Errorf("offset %d inside a record was reported as a boundary", offset)
+		}
+	}
+}
+
+func TestValidateLogTruncatesOnlyIncompleteFinalTails(t *testing.T) {
+	tests := []struct {
+		name string
+		tail []byte
+	}{
+		{name: "length prefix", tail: []byte{0x00, 0x00, 0x00}},
+		{
+			name: "record body",
+			tail: func() []byte {
+				tail := make([]byte, 4+5)
+				binary.BigEndian.PutUint32(tail[:4], 13)
+				copy(tail[4:], []byte{OpSet, 0, 0, 0, 0})
+				return tail
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "data.log")
+			record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+			offsets := writeRecoveryRecords(t, path, []Record{{Op: OpSet, Key: []byte("key"), Value: []byte("value")}})
+			appendRecoveryBytes(t, path, test.tail)
+
+			log, err := openLog(path)
+			if err != nil {
+				t.Fatalf("openLog() error = %v", err)
+			}
+			db := &DB{log: log}
+			validation, err := db.validateLog()
+			if err != nil {
+				_ = log.close()
+				t.Fatalf("validateLog() error = %v", err)
+			}
+			if err := log.close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+
+			wantEnd := offsets[0] + int64(len(record))
+			if validation.end != wantEnd {
+				t.Fatalf("validation end = %d, want %d", validation.end, wantEnd)
+			}
+			assertFileSize(t, path, wantEnd)
+		})
+	}
+}
+
+func TestOpenDoesNotSkipCompleteCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.log")
+	record := encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("key"), Value: []byte("value")})
+	record[4] ^= 0xff
+	createRecoveryLog(t, path)
+	appendRecoveryBytes(t, path, record)
+	appendRecoveryBytes(t, path, encodedRecoveryRecord(t, Record{Op: OpSet, Key: []byte("other"), Value: []byte("value")}))
+
+	if db, err := Open(path); err == nil {
+		_ = db.Close()
+		t.Fatal("Open() error = nil, want corruption error")
+	}
+}
+
 func writeRecoveryRecords(t *testing.T, path string, records []Record) []int64 {
 	t.Helper()
 
