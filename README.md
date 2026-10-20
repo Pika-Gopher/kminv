@@ -73,10 +73,16 @@ Within this repository, run the package tests with `go test ./...`.
 
 ## CLI
 
-The Stage 1 interactive client is available as a separate executable:
+The interactive client is available as a separate executable:
 
 ```text
 go run ./cmd/kminv ./data.kv
+```
+
+To build the CLI executable instead:
+
+```text
+go build -o ./kminv-cli ./cmd/kminv
 ```
 
 It opens the database once, displays a `kminv>` prompt, and supports `SET`,
@@ -88,6 +94,13 @@ in the terminal. Quote arguments containing spaces, for example:
 SET greeting "hello world"
 ```
 
+`SET` and `DELETE` print `OK` on success. `GET` prints the value or `Key not
+found`; `HAS` prints `true` or `false`. Commands and surrounding whitespace
+are case-insensitive/ignored as appropriate. Invalid commands, invalid
+argument counts, and unterminated quotes print an error and return to the
+prompt. `EXIT`, `QUIT`, and EOF close the database before the process exits;
+input and shutdown errors are reported.
+
 ## Behavior and limitations
 
 - Keys are limited to 1,024 bytes.
@@ -96,6 +109,8 @@ SET greeting "hello world"
 - The log is authoritative; snapshots are disposable derived state.
 - Each successful mutation is appended and synchronized before the in-memory
   index is changed.
+- The append-only log grows when keys are overwritten or deleted; compaction
+  and log reclamation are not implemented.
 - `File.Sync` is the practical durability boundary, not a guarantee against
   every hardware or filesystem failure.
 - Only one active database instance or process should access a database path.

@@ -216,6 +216,28 @@ snapshot persistence or log closure returns an error. Repeated `Close()` calls
 are no-ops and return `nil`. If the database is already in the failed mutation
 state, `Close()` skips snapshot persistence and still attempts to close the log.
 
+### 4.6 CLI boundary
+
+The interactive client is a separate executable under `cmd/kminv` and imports
+the root `kminv` package. It opens one database at startup and supports:
+
+```text
+SET <key> <value>
+GET <key>
+DELETE <key>
+HAS <key>
+HELP
+EXIT
+QUIT
+```
+
+Commands are case-insensitive. Arguments are separated by whitespace, and
+double quotes preserve spaces or represent empty arguments. Values are
+displayed as terminal text rather than a lossless binary representation.
+Invalid commands, argument counts, and unterminated quotes are reported while
+the session continues. `EXIT`, `QUIT`, EOF, and input errors close the
+database exactly once; close errors are returned to the CLI process.
+
 ---
 
 ## 5. On-Disk Log Format
@@ -1007,7 +1029,9 @@ Keep the implementation in one package initially. Split packages only when there
 
 Every overwrite creates another record. The log grows even when the logical database contains few keys.
 
-**Decision:** Accept this in V1. Measure the impact before designing compaction.
+Deletes also append records, and no compaction or log reclamation is
+implemented. **Decision:** Accept this in V1 and defer compaction until a
+measured need and a safe design exist.
 
 ### Disk read per lookup
 
