@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/peterh/liner"
 	"kminv"
 )
 
@@ -20,8 +21,14 @@ func main() {
 	}
 
 	fmt.Fprintln(os.Stdout, "Welcome to kminv.")
-	if err := runREPL(db, os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "kminv: %v\n", err)
+	var replErr error
+	if liner.TerminalSupported() {
+		replErr = runInteractiveREPL(db, os.Stdout)
+	} else {
+		replErr = runREPL(db, os.Stdin, os.Stdout)
+	}
+	if replErr != nil {
+		fmt.Fprintf(os.Stderr, "kminv: %v\n", replErr)
 		os.Exit(1)
 	}
 }

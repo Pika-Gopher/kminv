@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/peterh/liner"
 )
 
 type database interface {
@@ -15,9 +17,45 @@ type database interface {
 	Close() error
 }
 
-func runREPL(db database, input io.Reader, output io.Writer) (resultErr error) {
+// runREPL is the line-oriented fallback used for pipes, redirected input, and tests.
+func runREPL(db database, input io.Reader, output io.Writer) error {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	return runREPLWithReadLine(db, output, true, func() (string, error) {
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return "", err
+			}
+			return "", io.EOF
+		}
+		return scanner.Text(), nil
+	})
+}
+
+// runInteractiveREPL adds terminal line editing and in-session command history.
+// It should only be used when stdin and stdout are attached to a terminal.
+func runInteractiveREPL(db database, output io.Writer) error {
+	lineEditor := liner.NewLiner()
+	lineEditor.SetCtrlCAborts(true)
+	defer lineEditor.Close()
+
+	var previousHistoryEntry string
+	return runREPLWithReadLine(db, output, false, func() (string, error) {
+		line, err := lineEditor.Prompt("kminv> ")
+		if err != nil {
+			return "", err
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && trimmed != previousHistoryEntry {
+			lineEditor.AppendHistory(line)
+			previousHistoryEntry = trimmed
+		}
+		return line, nil
+	})
+}
+
+func runREPLWithReadLine(db database, output io.Writer, showPrompt bool, readLine func() (string, error)) (resultErr error) {
 	closed := false
 	finish := func(err error) error {
 		if closed {
@@ -28,63 +66,74 @@ func runREPL(db database, input io.Reader, output io.Writer) (resultErr error) {
 	}
 
 	for {
-		if _, err := fmt.Fprint(output, "kminv> "); err != nil {
-			return finish(fmt.Errorf("write prompt: %w", err))
-		}
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				return finish(fmt.Errorf("read input: %w", err))
+		if showPrompt {
+			if _, err := fmt.Fprint(output, "kminv> "); err != nil {
+				return finish(fmt.Errorf("write prompt: %w", err))
 			}
-			if _, err := fmt.Fprintln(output); err != nil {
-				return finish(fmt.Errorf("write output: %w", err))
-			}
-			return finish(nil)
 		}
 
-		args, err := parseArguments(scanner.Text())
+		line, err := readLine()
 		if err != nil {
-			if err := writeCommandError(output, err); err != nil {
-				return finish(err)
-			}
-			continue
-		}
-		if len(args) == 0 {
-			continue
-		}
-
-		switch strings.ToUpper(args[0]) {
-		case "HELP":
-			if len(args) != 1 {
-				err = fmt.Errorf("HELP takes no arguments")
-			} else {
-				err = writeHelp(output)
-			}
-		case "EXIT", "QUIT":
-			if len(args) != 1 {
-				err = fmt.Errorf("%s takes no arguments", strings.ToUpper(args[0]))
-			} else {
-				if _, writeErr := fmt.Fprintln(output, "Goodbye."); writeErr != nil {
-					err = fmt.Errorf("write output: %w", writeErr)
-				} else {
-					return finish(nil)
+			if errors.Is(err, liner.ErrPromptAborted) {
+				if _, writeErr := fmt.Fprintln(output, "^C"); writeErr != nil {
+					return finish(fmt.Errorf("write output: %w", writeErr))
 				}
+				continue
 			}
-		case "SET":
-			err = setCommand(db, output, args)
-		case "GET":
-			err = getCommand(db, output, args)
-		case "DELETE":
-			err = deleteCommand(db, output, args)
-		case "HAS":
-			err = hasCommand(db, output, args)
-		default:
-			err = fmt.Errorf("unknown command %q; type HELP for available commands", args[0])
+			if errors.Is(err, io.EOF) {
+				if _, writeErr := fmt.Fprintln(output); writeErr != nil {
+					return finish(fmt.Errorf("write output: %w", writeErr))
+				}
+				return finish(nil)
+			}
+			return finish(fmt.Errorf("read input: %w", err))
 		}
-		if err != nil {
-			if writeErr := writeCommandError(output, err); writeErr != nil {
+
+		exit, commandErr := executeCommand(db, output, line)
+		if commandErr != nil {
+			if writeErr := writeCommandError(output, commandErr); writeErr != nil {
 				return finish(writeErr)
 			}
 		}
+		if exit {
+			return finish(nil)
+		}
+	}
+}
+
+func executeCommand(db database, output io.Writer, line string) (bool, error) {
+	args, err := parseArguments(line)
+	if err != nil {
+		return false, err
+	}
+	if len(args) == 0 {
+		return false, nil
+	}
+
+	switch strings.ToUpper(args[0]) {
+	case "HELP":
+		if len(args) != 1 {
+			return false, fmt.Errorf("HELP takes no arguments")
+		}
+		return false, writeHelp(output)
+	case "EXIT", "QUIT":
+		if len(args) != 1 {
+			return false, fmt.Errorf("%s takes no arguments", strings.ToUpper(args[0]))
+		}
+		if _, err := fmt.Fprintln(output, "Goodbye."); err != nil {
+			return false, fmt.Errorf("write output: %w", err)
+		}
+		return true, nil
+	case "SET":
+		return false, setCommand(db, output, args)
+	case "GET":
+		return false, getCommand(db, output, args)
+	case "DELETE":
+		return false, deleteCommand(db, output, args)
+	case "HAS":
+		return false, hasCommand(db, output, args)
+	default:
+		return false, fmt.Errorf("unknown command %q; type HELP for available commands", args[0])
 	}
 }
 
