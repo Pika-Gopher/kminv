@@ -7,9 +7,10 @@ import (
 )
 
 const (
-	OpSet    		byte  = 0x01
-	OpDelete 		byte  = 0x02
-	maxRecordLength	uint32=1049613
+	OpSet           byte   = 0x01
+	OpDelete        byte   = 0x02
+	maxKeyLength    uint32 = 1024
+	maxRecordLength uint32 = 1049613
 )
 
 type Record struct {
@@ -25,7 +26,7 @@ func encodeRecord(r Record) ([]byte, error) {
 		return nil, fmt.Errorf("invalid record operation: %d", r.Op)
 	}
 
-	if len(r.Key) > 1024 {
+	if len(r.Key) > int(maxKeyLength) {
 		return nil, fmt.Errorf("key is too large: %d bytes", len(r.Key))
 	}
 	if len(r.Value) > 1<<20 {
@@ -76,7 +77,7 @@ func decodeRecord(data []byte) (Record, error) {
 	default:
 		return Record{}, fmt.Errorf("invalid record operation: %d", op)
 	}
-	if keyLength > 1024 {
+	if keyLength > maxKeyLength {
 		return Record{}, fmt.Errorf("key is too large: %d bytes", keyLength)
 	}
 	if valueLength > 1<<20 {
