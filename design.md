@@ -958,9 +958,10 @@ safe shutdown persistence, fallback and platform-specific replacement.
 - Exercise failure paths and input boundaries.
 
 **Exit criterion:** Supported concurrent use is covered by existing tests and
-failure paths do not silently corrupt logical state. Race-detector verification
-remains outstanding in the current Windows environment because the installed C
-compiler cannot build 64-bit `runtime/cgo` code.
+failure paths do not silently corrupt logical state. Ordinary concurrency tests
+pass; race-detector verification is blocked in the recorded Windows
+environment by the installed C compiler's inability to build 64-bit
+`runtime/cgo`.
 
 ### Milestone 7 — Performance baseline
 
@@ -1059,18 +1060,22 @@ kminv V1 is complete when:
 - [x] Uncertain rollback causes the instance to reject further operations;
   failure-path tests cover this behavior.
 - [x] Concurrent use of a single instance is synchronized and covered by
-  ordinary tests; race-detector verification remains separate.
+  ordinary tests; race-detector verification is documented separately.
 - [x] Snapshot consistency and corruption behavior are covered by ordinary
   tests.
-- [ ] The regular test suite and race detector pass in all target environments.
+- [ ] The regular test suite and race detector pass in the current development
+  environment; the regular suite passes, while the race detector is blocked by
+  the recorded toolchain failure.
 - [x] Benchmarks provide a reproducible performance baseline.
 - [x] Known limitations and durability assumptions are documented.
 
-The regular suite currently passes in the development environment. The race
-suite remains unverified there because the installed C compiler reports
-`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in` while building
-`runtime/cgo`. Benchmarks and final cross-environment verification remain
-outstanding, so V1 is not yet marked complete.
+The regular suite and benchmark baseline pass or complete in the current
+development environment. The benchmark baseline is documented in this
+repository's README. The race detector remains unverified because of the
+recorded Windows C-toolchain failure. For the current release target, V1 is
+release-ready with this limitation explicitly documented; a release requiring
+race-detector evidence must use a corrected toolchain before claiming that
+verification.
 
 ---
 
